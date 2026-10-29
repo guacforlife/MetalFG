@@ -418,6 +418,7 @@ static const MetalFGVertex kQuadVertices[6] = {
         _inFlightGpuFrames = 0;
         _debugTintEnabled = NO;
         _motionScale = 0.50f;
+        _syntheticMinDuration = kProMotion120HzMinDuration;
         _disocclusionThreshold = 0.18f;
         _uiSensitivity = 0.035f;
         _motionDeadzone = 0.0003f;
@@ -728,6 +729,12 @@ static const MetalFGVertex kQuadVertices[6] = {
     
     [cmdBuffer commit];
     return YES;
+}
+
+- (void)resetHistory {
+    os_unfair_lock_lock(&_textureLock);
+    _hasValidBaseFrame = NO;
+    os_unfair_lock_unlock(&_textureLock);
 }
 
 - (BOOL)isGpuBusy {
@@ -1051,7 +1058,9 @@ static const MetalFGVertex kQuadVertices[6] = {
     
     // Hardware-paced 120Hz presentation: queues Ground Truth Frame N on the very next 120Hz VSYNC tick
     // right after S_{N-0.5}'s 8.33ms minimum duration expires!
-    [cmdBuffer presentDrawable:targetDrawable afterMinimumDuration:kProMotion120HzMinDuration];
+    // afterMinimumDuration applies to the drawable on screen BEFORE this one: the generated frame
+    // stays up for syntheticMinDuration before the real frame replaces it
+    [cmdBuffer presentDrawable:targetDrawable afterMinimumDuration:MAX(kProMotion120HzMinDuration, self.syntheticMinDuration)];
     
     _inFlightGpuFrames.fetch_add(1);
     __weak MetalFGWarper *weakSelf = self;

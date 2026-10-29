@@ -7,6 +7,8 @@
 #import <mach-o/dyld.h>
 #import <stdlib.h>
 #import <atomic>
+#import <notify.h>
+#import <os/lock.h>
 
 #import "../Headers/ShaderTypes.h"
 #import "../Headers/TouchTracker.h"
@@ -62,6 +64,129 @@ static std::atomic<uint64_t> gStatPassThrough{0};           // native presents l
 static std::atomic<uint64_t> gStatNativeProcessed{0};       // frames handed to the synchronizer
 static std::atomic<uint64_t> gStatLayerMismatch{0};         // frames dropped: drawable not on the active layer
 
+// Frame pacing of everything shown on the game layer (native and generated), from presentedTime.
+// Buckets: intervals up to ~1, 2, 3 and more than 3 refreshes of a 120 Hz screen.
+static os_unfair_lock gPaceLock = OS_UNFAIR_LOCK_INIT;
+static CFTimeInterval gPaceLast;
+static uint64_t gPaceCount, gPaceBuckets[4];
+static double gPaceSum, gPaceSumSq, gPaceMax;
+
+static std::atomic<int> gTrace{0};  // frames left to trace after a settings reload
+
+// Freeze guard. Taking over a frame hides the game's own present; if MetalFG's presents then stop
+// reaching the screen (seen once after re-enabling mid-session: the pill kept counting while the
+// game layer stayed frozen until a relaunch), suspend frame generation so the game shows its own
+// frames again. Triggers: a GPU error on a MetalFG present, or kMaxTakeoversUnshown game frames
+// taken over with nothing shown in between.
+static const int kMaxTakeoversUnshown = 45;
+static std::atomic<int> gTakeoversSinceShown{0};
+static std::atomic<uint64_t> gStatGpuErrors{0};
+
+// Native frame interval (smoothed), measured where the game's presents are intercepted, so it keeps
+// updating while frame generation is paused
+static std::atomic<double> gNativeInterval{0};
+static std::atomic<uint64_t> gStatPausedSlow{0}, gStatPausedFast{0};
+
+static void NoteNativeFrame(void) {
+    static std::atomic<double> last{0};
+    CFTimeInterval now = CACurrentMediaTime(), prev = last.exchange(now);
+    double dt = now - prev, ema = gNativeInterval.load();
+    // Slow average (~20 frames): one long frame must not flip frame generation on or off
+    if (prev > 0 && dt > 0.002 && dt < 0.25) gNativeInterval = ema > 0 ? ema * 0.95 + dt * 0.05 : dt;
+}
+
+// Frame generation only pays off when the game renders well below the screen rate, and (minNativeFps)
+// only when the user wants it: returns NO for frames that must stay native
+static BOOL MFGNativeRateWantsGeneration(MetalFGSynchronizer *sync) {
+    static std::atomic<int> state{-1};   // 0 generating, 1 too slow, 2 no headroom
+    double interval = gNativeInterval.load(), refresh = sync.refreshInterval;
+    float minFps = sync.minNativeFps;
+    int was = state.load(), now = 0;
+    // Hysteresis around the minimum: pause below 84% of it, resume above 96% (minimum 50: pause
+    // under 42 fps, resume over 48), so TrumpetDismiss's idle 40 and touching 60 sit clearly apart
+    double needFps = minFps * (was == 1 ? 0.96 : 0.84);
+    if (interval > 0 && minFps > 0 && 1.0 / interval < needFps) now = 1;
+    // Under 1.6 refreshes per native frame there is no room for a frame in between
+    // (above ~75 fps on a 120 Hz screen, above ~37 on 60 Hz)
+    else if (interval > 0 && refresh > 0 && interval < refresh * 1.6) now = 2;
+    if (state.exchange(now) != now && was != -1) {
+        MFGLog(@"frame generation %@ (native %.1f fps, min %.0f, screen %.0f Hz)",
+               now == 0 ? @"active" : now == 1 ? @"paused: native rate below the minimum" : @"paused: native rate near the screen rate",
+               interval > 0 ? 1.0 / interval : 0, minFps, refresh > 0 ? 1.0 / refresh : 0);
+    }
+    if (now == 1) gStatPausedSlow++;
+    if (now == 2) gStatPausedFast++;
+    return now == 0;
+}
+
+static void SuspendFrameGeneration(NSString *why) {
+    MetalFGSynchronizer *sync = [MetalFGSynchronizer sharedSynchronizer];
+    if (!sync.isEnabled) return;
+    [sync suspendFrameGeneration];
+    gTakeoversSinceShown = 0;
+    MFGLog(@"frame generation suspended (%@): the game shows its own frames; tap the pill or relaunch to retry", why);
+}
+
+// Returns NO when the game frame must be left to the game (frame generation off or just suspended)
+static BOOL MFGMayTakeOver(void) {
+    MetalFGSynchronizer *sync = [MetalFGSynchronizer sharedSynchronizer];
+    NoteNativeFrame();
+    if (!sync.isEnabled || !MFGNativeRateWantsGeneration(sync)) return NO;
+    if (++gTakeoversSinceShown > kMaxTakeoversUnshown) {
+        SuspendFrameGeneration([NSString stringWithFormat:@"%d game frames taken over, none shown", kMaxTakeoversUnshown]);
+        return NO;
+    }
+    return YES;
+}
+
+static void WatchSyntheticPresent(id<MTLCommandBuffer> commandBuffer) {
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (cb.status != MTLCommandBufferStatusError) return;
+        if (++gStatGpuErrors <= 3) MFGLog(@"GPU error in %@: %@", cb.label, cb.error);
+        [[MetalFGSynchronizer sharedSynchronizer] noteGpuFault];
+        SuspendFrameGeneration(@"GPU error");
+    }];
+}
+
+static void PaceRecord(CFTimeInterval t) {
+    os_unfair_lock_lock(&gPaceLock);
+    if (gPaceLast > 0 && t > gPaceLast && t - gPaceLast < 0.25) {  // longer gaps are pauses, not pacing
+        double dt = t - gPaceLast;
+        gPaceCount++;
+        gPaceSum += dt;
+        gPaceSumSq += dt * dt;
+        if (dt > gPaceMax) gPaceMax = dt;
+        gPaceBuckets[dt <= 0.0104 ? 0 : dt <= 0.0188 ? 1 : dt <= 0.0271 ? 2 : 3]++;
+    }
+    if (t > gPaceLast) gPaceLast = t;
+    os_unfair_lock_unlock(&gPaceLock);
+}
+
+// `notifyutil -p com.dnullptr.metalfg.stats` logs the rates and pacing since the previous call
+static void MFGLogWindowStats(void) {
+    static CFTimeInterval lastAt;
+    static uint64_t lastNative, lastShown;
+    CFTimeInterval now = CACurrentMediaTime();
+    uint64_t native = gStatSuppressed.load() + gStatPassThrough.load(), shown = gStatPresented.load();
+    os_unfair_lock_lock(&gPaceLock);
+    uint64_t n = gPaceCount, b0 = gPaceBuckets[0], b1 = gPaceBuckets[1], b2 = gPaceBuckets[2], b3 = gPaceBuckets[3];
+    double sum = gPaceSum, sumSq = gPaceSumSq, max = gPaceMax;
+    gPaceCount = gPaceBuckets[0] = gPaceBuckets[1] = gPaceBuckets[2] = gPaceBuckets[3] = 0;
+    gPaceSum = gPaceSumSq = gPaceMax = 0;
+    os_unfair_lock_unlock(&gPaceLock);
+    if (lastAt > 0) {
+        double dt = now - lastAt, mean = n ? sum / n : 0, sd = n ? sqrt(MAX(0.0, sumSq / n - mean * mean)) : 0;
+        MetalFGSynchronizer *sync = [MetalFGSynchronizer sharedSynchronizer];
+        MFGLog(@"window %.1f s: native %.1f fps, shown %.1f fps | interval mean %.2f ms sd %.2f max %.1f | <=10ms %llu <=19ms %llu <=27ms %llu >27ms %llu | FG %@ preset %ld | gpu errors %llu | drawable %.0fx%.0f | paused slow %llu fast %llu",
+               dt, (native - lastNative) / dt, (shown - lastShown) / dt, mean * 1000, sd * 1000, max * 1000,
+               b0, b1, b2, b3, sync.isEnabled ? @"on" : @"off", (long)sync.currentPreset, gStatGpuErrors.load(),
+               sync.activeLayer.drawableSize.width, sync.activeLayer.drawableSize.height, gStatPausedSlow.load(), gStatPausedFast.load());
+    }
+    lastAt = now;
+    lastNative = native;
+    lastShown = shown;
+}
+
 // Helper: Determine if a layer is a candidate for the primary game rendering layer
 static inline BOOL IsGameLayerCandidate(CAMetalLayer *layer) {
     if (!layer) return NO;
@@ -86,16 +211,10 @@ static inline BOOL IsGameLayerCandidate(CAMetalLayer *layer) {
     return YES;
 }
 
-// ============================================================================
-// Hook: Unlock 120Hz ProMotion on iOS 16 Devices
-// ============================================================================
-%hook UIScreen
-
-- (NSInteger)maximumFramesPerSecond {
-    return 120;
-}
-
-%end
+// No UIScreen.maximumFramesPerSecond override: with CADisableMinimumFrameDurationOnPhone forced on
+// (below) UIKit already reports 120 on ProMotion screens, and a hard-coded 120 made 60 Hz phones
+// (iPhone 7 Plus) look like ProMotion to the game and to TrumpetDismiss, which then picked frame
+// rates that do not divide 60 and paced unevenly.
 
 // ============================================================================
 // Hook: NSBundle to enable ProMotion 120Hz for any game
@@ -182,7 +301,15 @@ static inline BOOL IsGameLayerCandidate(CAMetalLayer *layer) {
                    self.drawableSize.width, self.drawableSize.height);
         }
         [drawable addPresentedHandler:^(id<MTLDrawable> d) {
-            if (d.presentedTime > 0) gStatPresented++; else gStatPresentDropped++;
+            CFTimeInterval t = d.presentedTime;
+            if (gTrace.load() > 0) MFGLog(@"trace presented %p t %.4f synthetic %@", d, t, objc_getAssociatedObject(d, &kMetalFGIsSyntheticKey));
+            if (t > 0) {
+                gTakeoversSinceShown = 0;
+                gStatPresented++;
+                PaceRecord(t);
+            } else {
+                gStatPresentDropped++;
+            }
         }];
     }
     return drawable;
@@ -193,7 +320,8 @@ static inline BOOL IsGameLayerCandidate(CAMetalLayer *layer) {
 // ============================================================================
 // Helper: Process Native Frame Presentation
 // ============================================================================
-static inline void ProcessNativePresentation(id<CAMetalDrawable> drawable) {
+// takenOver: the hook hid the game's present of this drawable, so it must still reach the screen
+static inline void ProcessNativePresentation(id<CAMetalDrawable> drawable, BOOL takenOver) {
     if (!drawable) return;
     
     // 1. Recursion guard: ignore our own synthetic warp frames
@@ -225,11 +353,16 @@ static inline void ProcessNativePresentation(id<CAMetalDrawable> drawable) {
         if (gStatLayerMismatch++ < 3) {
             MFGLog(@"drop: drawable layer %@ is not the active layer %@", drawable.layer, activeLayer);
         }
+        if (takenOver) [drawable present];
         return;
     }
 
     gStatNativeProcessed++;
-    [[MetalFGSynchronizer sharedSynchronizer] notifyNativeFrameRendered:drawable];
+    if (gTrace.load() > 0) {
+        MFGLog(@"trace process %p | %@", drawable, [[MetalFGSynchronizer sharedSynchronizer] debugState]);
+        gTrace--;
+    }
+    [[MetalFGSynchronizer sharedSynchronizer] notifyNativeFrameRendered:drawable takenOver:takenOver];
 }
 
 // ============================================================================
@@ -245,15 +378,17 @@ static BOOL InterceptNativePresent(id<MTLCommandBuffer> commandBuffer, id<MTLDra
     id<CAMetalDrawable> metalDrawable = (id<CAMetalDrawable>)drawable;
     NSNumber *isSynthetic = objc_getAssociatedObject(metalDrawable, &kMetalFGIsSyntheticKey);
     if (isSynthetic && [isSynthetic boolValue]) {
+        WatchSyntheticPresent(commandBuffer);
         return NO;
     }
     objc_setAssociatedObject(metalDrawable, &kMFGPresentHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     id<MTLTexture> tex = metalDrawable.texture;
     BOOL isGameDrawable = (tex && tex.width >= 250 && tex.height >= 150 && IsGameLayerCandidate(metalDrawable.layer));
+    BOOL takeOver = isGameDrawable && MFGMayTakeOver();
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        ProcessNativePresentation(metalDrawable);
+        ProcessNativePresentation(metalDrawable, takeOver);
     }];
-    if (isGameDrawable && [MetalFGSynchronizer sharedSynchronizer].isEnabled) {
+    if (takeOver) {
         gStatSuppressed++;
         return YES; // Suppress direct presentation: Option 3 presents S_{N-0.5} upon completion!
     }
@@ -289,10 +424,11 @@ static BOOL InterceptScheduledDrawablePresent(id<CAMetalDrawable> drawable) {
     if (!logged.exchange(true)) {
         MFGLog(@"game presents from a scheduled handler on %s: intercepting", object_getClassName(commandBuffer));
     }
-    BOOL takeOver = [MetalFGSynchronizer sharedSynchronizer].isEnabled;
+    BOOL takeOver = MFGMayTakeOver();
+    if (gTrace.load() > 0) MFGLog(@"trace native present %p takeOver %d", drawable, takeOver);
     dispatch_async(gScheduledPresentQueue, ^{
         [commandBuffer waitUntilCompleted];
-        ProcessNativePresentation(drawable);
+        ProcessNativePresentation(drawable, takeOver);
     });
     if (takeOver) gStatSuppressed++; else gStatPassThrough++;
     return takeOver;
@@ -337,18 +473,21 @@ static BOOL InterceptScheduledDrawablePresent(id<CAMetalDrawable> drawable) {
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
     gStatCommandBufferPresent++;
+    if (gTrace.load() > 0) MFGLog(@"trace cb %s %p synthetic %@", sel_getName(_cmd), drawable, objc_getAssociatedObject(drawable, &kMetalFGIsSyntheticKey));
     if (InterceptNativePresent((id<MTLCommandBuffer>)self, drawable)) return;
     %orig(drawable);
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime {
     gStatCommandBufferPresent++;
+    if (gTrace.load() > 0) MFGLog(@"trace cb %s %p synthetic %@", sel_getName(_cmd), drawable, objc_getAssociatedObject(drawable, &kMetalFGIsSyntheticKey));
     if (InterceptNativePresent((id<MTLCommandBuffer>)self, drawable)) return;
     %orig(drawable, presentationTime);
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
     gStatCommandBufferPresent++;
+    if (gTrace.load() > 0) MFGLog(@"trace cb %s %p synthetic %@", sel_getName(_cmd), drawable, objc_getAssociatedObject(drawable, &kMetalFGIsSyntheticKey));
     if (InterceptNativePresent((id<MTLCommandBuffer>)self, drawable)) return;
     %orig(drawable, duration);
 }
@@ -449,6 +588,17 @@ static BOOL InterceptScheduledDrawablePresent(id<CAMetalDrawable> drawable) {
         NSLog(@"[MetalFG] Initializing MetalFG v2.3.0 (SMFG 1.1 True-Midpoint Engine) for target: %s (%s)", progname, execPath);
         NSLog(@"==================================================");
         
+        // iOS holds an iPhone app to 60 Hz on a ProMotion screen unless its Info.plist sets
+        // CADisableMinimumFrameDurationOnPhone. Core Animation reads the bundle's own info dictionary,
+        // which the NSBundle hooks below do not change (they return a modified copy), so Google Maps
+        // stayed at 60 Hz. The main bundle's dictionary is mutable: set the key in it before UIKit and
+        // QuartzCore read it (TrumpetDismiss does the same for Z Route).
+        NSString *promotionKey = @"CADisableMinimumFrameDurationOnPhone";
+        @try {
+            id info = NSBundle.mainBundle.infoDictionary;
+            if ([info isKindOfClass:[NSMutableDictionary class]]) [(NSMutableDictionary *)info setObject:@YES forKey:promotionKey];
+        } @catch (id e) {}
+        
         gScheduledPresentQueue = dispatch_queue_create("com.metalfg.scheduledpresent",
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         
@@ -456,8 +606,22 @@ static BOOL InterceptScheduledDrawablePresent(id<CAMetalDrawable> drawable) {
         %init;
 
         [[NSFileManager defaultManager] removeItemAtPath:MFGLogPath() error:nil];
-        MFGLog(@"loaded into %s", progname);
+        MFGLog(@"loaded into %s, %@ = %@", progname, promotionKey, [NSBundle.mainBundle objectForInfoDictionaryKey:promotionKey]);
 
+        int statsToken, reloadToken;
+        notify_register_dispatch("com.dnullptr.metalfg.stats", &statsToken, dispatch_get_main_queue(), ^(int t) {
+            MFGLogWindowStats();
+        });
+        // `notifyutil -p com.dnullptr.metalfg.reload` applies an edited settings file without a relaunch
+        notify_register_dispatch("com.dnullptr.metalfg.reload", &reloadToken, dispatch_get_main_queue(), ^(int t) {
+            MetalFGSynchronizer *sync = [MetalFGSynchronizer sharedSynchronizer];
+            [sync reloadPreferences];
+            gTrace = 30;
+            MFGLog(@"reload state: %@", [sync debugState]);
+            MFGLog(@"settings reloaded: FG %@ preset %ld motion %.2f ghost %.2f ui %.3f deadzone %.4f min native %.0f fps", sync.isEnabled ? @"on" : @"off",
+                   (long)sync.currentPreset, sync.motionScale, sync.disocclusionThreshold, sync.uiSensitivity, sync.motionDeadzone, sync.minNativeFps);
+        });
+        
         static dispatch_source_t statsTimer;
         static int statsTicks = 0;
         statsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));

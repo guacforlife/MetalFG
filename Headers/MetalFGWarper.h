@@ -26,6 +26,10 @@ extern const char kMetalFGIsSyntheticKey;
 @property (nonatomic, assign) float uiSensitivity;           // Default 0.035 (static UI threshold)
 @property (nonatomic, assign) float motionDeadzone;          // Default 0.0004 (velocity cutoff)
 @property (nonatomic, assign) BOOL debugTintEnabled;
+// How long the generated frame stays up before the real one may replace it (the minimum duration
+// of the real frame's present). The synchronizer sets half the native frame interval, so each frame
+// gets an equal share (30 fps native -> 16.7 + 16.7 ms)
+@property (nonatomic, assign) CFTimeInterval syntheticMinDuration;
 
 // Lifecycle
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
@@ -51,6 +55,8 @@ extern const char kMetalFGIsSyntheticKey;
 
 // Check if a synthetic frame is currently processing on GPU
 - (BOOL)isGpuBusy;
+// Forget the cached previous frame: the next native frame is shown as is, not interpolated
+- (void)resetHistory;
 
 @end
 

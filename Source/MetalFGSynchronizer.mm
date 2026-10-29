@@ -5,6 +5,8 @@
 #import <os/lock.h>
 
 @interface MetalFGSynchronizer () {
+    BOOL _gpuFaulted;
+    CFTimeInterval _refreshInterval;   // the display link's frame length: 1/120 on ProMotion, 1/60 otherwise
     NSThread *_syncThread;
     CADisplayLink *_displayLink;
     BOOL _shouldStopThread;
@@ -44,6 +46,12 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
     if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"]) {
         return kRootlessPrefsPath;
     }
+    // A sandboxed app can't write /var/mobile/Library/Preferences (on roothide /var/jb isn't visible
+    // to apps either), so settings never persisted: keep them in the app's own container
+    NSString *home = NSHomeDirectory();
+    if ([home containsString:@"/Containers/Data/Application/"]) {
+        return [home stringByAppendingPathComponent:@"Library/Preferences/com.dnullptr.metalfg.plist"];
+    }
     return kStandardPrefsPath;
 }
 
@@ -60,6 +68,7 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
         _uiSensitivity = (dict[@"uiSensitivity"] != nil) ? [dict[@"uiSensitivity"] floatValue] : 0.035f;
         _motionDeadzone = (dict[@"motionDeadzone"] != nil) ? [dict[@"motionDeadzone"] floatValue] : 0.0003f;
         _debugTint = (dict[@"debugTint"] != nil) ? [dict[@"debugTint"] boolValue] : NO;
+        _minNativeFps = [dict[@"minNativeFps"] floatValue];
     } else {
         // Initialize clean v2.3.0 defaults (True 50% Midpoint Interpolation)
         _isEnabled = (dict && dict[@"isEnabled"] != nil) ? [dict[@"isEnabled"] boolValue] : YES;
@@ -71,6 +80,30 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
         _debugTint = (dict && dict[@"debugTint"] != nil) ? [dict[@"debugTint"] boolValue] : NO;
         [self savePreferences];
     }
+}
+
+// Turn frame generation off for this session only (not saved): the pill shows OFF, a tap re-arms it
+- (void)suspendFrameGeneration {
+    _isEnabled = NO;
+}
+
+- (NSString *)debugState {
+    os_unfair_lock_lock(&_syncLock);
+    NSString *st = [NSString stringWithFormat:@"bg %d pending %d warper %@ ready %d gpuBusy %d interval %.1f ms", _isBackgrounded,
+                    _hasPendingNativePresent, _warper ? @"yes" : @"nil", _warper.isReady, [_warper isGpuBusy], _smoothedNativeInterval * 1000];
+    os_unfair_lock_unlock(&_syncLock);
+    return st;
+}
+
+// Re-read the settings file and push the values into the running warper
+- (void)reloadPreferences {
+    [self loadPreferences];
+    if (_isEnabled) [self replaceWarperAfterGpuFault];
+    self.motionScale = _motionScale;
+    self.disocclusionThreshold = _disocclusionThreshold;
+    self.uiSensitivity = _uiSensitivity;
+    self.motionDeadzone = _motionDeadzone;
+    self.debugTint = _debugTint;
 }
 
 - (void)savePreferences {
@@ -87,6 +120,7 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
     dict[@"uiSensitivity"] = @(_uiSensitivity);
     dict[@"motionDeadzone"] = @(_motionDeadzone);
     dict[@"debugTint"] = @(_debugTint);
+    dict[@"minNativeFps"] = @(_minNativeFps);
     [dict writeToFile:path atomically:YES];
 }
 
@@ -165,7 +199,36 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
 
 - (void)setIsEnabled:(BOOL)isEnabled {
     _isEnabled = isEnabled;
+    if (isEnabled) [self replaceWarperAfterGpuFault];
     [self savePreferences];
+}
+
+- (CFTimeInterval)refreshInterval {
+    return _refreshInterval;
+}
+
+- (void)noteGpuFault {
+    os_unfair_lock_lock(&_syncLock);
+    _gpuFaulted = YES;
+    os_unfair_lock_unlock(&_syncLock);
+}
+
+- (void)replaceWarperAfterGpuFault {
+    os_unfair_lock_lock(&_syncLock);
+    if (_gpuFaulted && _warper) {
+        MetalFGWarper *fresh = [[MetalFGWarper alloc] initWithDevice:_warper.device pixelFormat:_warper.pixelFormat];
+        if (fresh) {
+            fresh.debugTintEnabled = _debugTint;
+            fresh.motionScale = _motionScale;
+            fresh.disocclusionThreshold = _disocclusionThreshold;
+            fresh.uiSensitivity = _uiSensitivity;
+            fresh.motionDeadzone = _motionDeadzone;
+            _warper = fresh;
+            _hasPendingNativePresent = NO;
+            _gpuFaulted = NO;
+        }
+    }
+    os_unfair_lock_unlock(&_syncLock);
 }
 
 - (instancetype)init {
@@ -178,6 +241,7 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
         _hasInjectedForCurrentNativeFrame = NO;
         _hasPendingNativePresent = NO;
         _smoothedNativeInterval = 1.0 / 60.0;
+        _refreshInterval = 1.0 / 60.0;
         _nativeFrameCount = 0;
         _syntheticFrameCount = 0;
         _lastStatsLogTime = CACurrentMediaTime();
@@ -294,7 +358,15 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
 }
 
 - (void)notifyNativeFrameRendered:(id<CAMetalDrawable>)drawable {
-    if (_isBackgrounded || !drawable) return;
+    [self notifyNativeFrameRendered:drawable takenOver:YES];
+}
+
+- (void)notifyNativeFrameRendered:(id<CAMetalDrawable>)drawable takenOver:(BOOL)takenOver {
+    if (!drawable) return;
+    if (_isBackgrounded) {
+        if (takenOver) [drawable present];
+        return;
+    }
     
     id<MTLTexture> texture = drawable.texture;
     if (!texture || texture.width < 250 || texture.height < 150) {
@@ -315,9 +387,33 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
     }
     MetalFGWarper *currentWarper = _warper;
     BOOL enabled = _isEnabled;
+    CFTimeInterval nativeInterval = _smoothedNativeInterval;
     os_unfair_lock_unlock(&_syncLock);
     
-    if (enabled && currentWarper) {
+    if (!takenOver && enabled && currentWarper) {
+        // Frame generation is on but paused for this frame (native rate outside its range): drop the
+        // pending real-frame present, which would now be older than what the game just showed, and
+        // start the next interpolation from a fresh frame
+        os_unfair_lock_lock(&_syncLock);
+        _hasPendingNativePresent = NO;
+        os_unfair_lock_unlock(&_syncLock);
+        [currentWarper resetHistory];
+        return;
+    }
+    
+    if (takenOver && !(enabled && currentWarper)) {
+        // Taken over just before frame generation went off: show the game's frame as it is
+        [drawable present];
+        return;
+    }
+    
+    if (enabled && currentWarper && takenOver) {
+        // Split each native frame's refreshes between the generated and the real frame, the
+        // generated one getting half rounded down (2 ms margin to latch on the earlier refresh):
+        // on 120 Hz, 30 fps native -> 2 + 2 refreshes, 40 -> 1 + 2, 60 -> 1 + 1
+        CFTimeInterval refresh = _refreshInterval;
+        long refreshesPerFrame = lround(nativeInterval / refresh);
+        currentWarper.syntheticMinDuration = MAX(1L, refreshesPerFrame / 2) * refresh - 0.002;
         // Option 3: Full 1-Frame Latency True Interpolation Model (LSFG / DLSS 3)
         // 1. Warper saves Ground Truth Frame N into double-buffered cache.
         // 2. Warper computes coarse-to-fine motion field between Frame N-1 and Frame N.
@@ -371,6 +467,8 @@ static NSString * const kCurrentPrefsSchema = @"2.3.0";
 
 - (void)onDisplayTick:(CADisplayLink *)link {
     @autoreleasepool {
+        CFTimeInterval frame = link.targetTimestamp - link.timestamp;
+        if (frame > 0.004 && frame < 0.05) _refreshInterval = frame;
         if (_isBackgrounded) return;
         
         // Periodic FPS logging & On-Screen Overlay update (every 1.0s, evaluated on display link tick)
